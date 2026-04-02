@@ -93,25 +93,20 @@ function DayRow({date,data,result,isToday,onChange,onInit}){
   const labelStyle=(field)=>({position:"absolute",top:-1,left:8,fontSize:8,color:T.sub,background:cardBg,padding:"0 3px",zIndex:1});
 
   return React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:8,padding:"12px 14px",background:cardBg,borderRadius:10,border:isToday?"1.5px solid "+T.accentS:"1px solid "+T.border}},
-    // top row
     React.createElement("div",{style:{display:"flex",alignItems:"center",gap:8}},
-      // day badge
       React.createElement("div",{onClick:onInit,style:{width:36,height:36,borderRadius:10,background:isToday?T.accent:T.bg,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",flexShrink:0,cursor:"pointer"}},
         React.createElement("span",{style:{fontSize:13,fontWeight:700,color:isToday?"#fff":T.text,lineHeight:1}},DK[date.getDay()]),
         React.createElement("span",{style:{fontSize:8,color:isToday?"rgba(255,255,255,0.7)":T.sub,lineHeight:1,marginTop:1}},fmtMD(date))
       ),
-      // leave pills
       React.createElement("div",{style:{display:"flex",gap:3,flex:1,background:T.bg,borderRadius:8,padding:2}},
         Object.entries(LV).map(([k,v])=>
           React.createElement("button",{key:k,onClick:()=>onChange("leaveType",k),style:{flex:1,padding:"5px 0",fontSize:10,fontWeight:data.leaveType===k?700:500,background:data.leaveType===k?v.color:"transparent",color:data.leaveType===k?"#fff":T.sub,border:"none",borderRadius:6,cursor:"pointer",transition:"all 0.15s"}},v.label)
         )
       ),
-      // hours
       React.createElement("div",{style:{minWidth:44,textAlign:"center",background:filled?T.okL:isFull?T.okL:"transparent",padding:"4px 8px",borderRadius:8}},
         React.createElement("span",{style:{fontSize:15,fontWeight:800,fontFamily:"'SF Mono',monospace",color:filled?T.ok:result.credited>0?T.text:T.dim}},dec(result.credited))
       )
     ),
-    // time inputs
     !isFull && React.createElement("div",{style:{display:"flex",gap:8,alignItems:"center",paddingLeft:44}},
       React.createElement("div",{style:{flex:1,position:"relative"}},
         React.createElement("span",{style:labelStyle("in")},"출근"),
@@ -145,7 +140,7 @@ function AuthScreen({onLogin}){
       const res=await fetch(SB_URL+ep,{method:"POST",headers:{apikey:SB_KEY,"Content-Type":"application/json"},body:JSON.stringify({email,password:pw})});
       const data=await res.json();
       if(!res.ok){const m=data.msg||data.error_description||data.message||"";if(m.includes("Invalid login"))throw new Error("아이디 또는 비밀번호가 틀렸습니다");if(m.includes("already registered"))throw new Error("이미 사용 중인 아이디입니다");throw new Error(m||"인증 실패");}
-      if(data.access_token){onLogin({token:data.access_token,userId:data.user.id,username:un.trim().toLowerCase()});}
+      if(data.access_token){onLogin({token:data.access_token,refreshToken:data.refresh_token,userId:data.user.id,username:un.trim().toLowerCase()});}
       else if(isSign){setErr("가입 완료! 로그인해주세요.");setIsSign(false);}
     }catch(e){setErr(e.message);}finally{setLoading(false);}
   };
@@ -174,11 +169,23 @@ function AuthScreen({onLogin}){
   );
 }
 
+// ── Session Persist ──
+function saveSession(s){try{localStorage.setItem("wt_auth",JSON.stringify(s));}catch(e){}}
+function loadSession(){try{const s=localStorage.getItem("wt_auth");return s?JSON.parse(s):null;}catch(e){return null;}}
+function clearSession(){try{localStorage.removeItem("wt_auth");}catch(e){}}
+async function refreshAuth(rt){
+  try{const res=await fetch(SB_URL+"/auth/v1/token?grant_type=refresh_token",{method:"POST",headers:{apikey:SB_KEY,"Content-Type":"application/json"},body:JSON.stringify({refresh_token:rt})});
+  const data=await res.json();if(!res.ok)return null;
+  const prev=loadSession();
+  return{token:data.access_token,refreshToken:data.refresh_token,userId:data.user.id,username:prev?.username||"user"};}catch(e){return null;}
+}
+
 // ── Main App ──
 function App(){
   const[auth,setAuth]=useState(null);
   const[syncing,setSyncing]=useState(false);
   const[lastSaved,setLastSaved]=useState(null);
+  const[restoring,setRestoring]=useState(true);
   const today=useMemo(()=>new Date(),[]);
   const[monRef,setMonRef]=useState(()=>getMon(today));
   const weekDays=useMemo(()=>getWD(monRef),[monRef]);
@@ -195,13 +202,24 @@ function App(){
     }catch(e){console.error("Load:",e);}
   },[auth]);
 
+  // restore session on mount
+  useEffect(()=>{
+    const saved=loadSession();
+    if(saved&&saved.refreshToken){
+      refreshAuth(saved.refreshToken).then(s=>{
+        if(s){saveSession(s);setAuth(s);loadW(getWD(getMon(today)),s);}
+        setRestoring(false);
+      });
+    }else{setRestoring(false);}
+  },[]);
+
   const saveD=useCallback(async(date,data)=>{
     if(!auth)return;setSyncing(true);
     try{await sbFetch("/rest/v1/work_hours?on_conflict=user_id,date",{method:"POST",token:auth.token,body:{user_id:auth.userId,date:dk(date),clock_in:data.clockIn||null,clock_out:data.clockOut||null,leave_type:data.leaveType}});setLastSaved(new Date());}
     catch(e){console.error("Save:",e);}finally{setSyncing(false);}
   },[auth]);
 
-  const handleLogin=useCallback(s=>{setAuth(s);loadW(getWD(getMon(today)),s);},[today,loadW]);
+  const handleLogin=useCallback(s=>{saveSession(s);setAuth(s);loadW(getWD(getMon(today)),s);},[today,loadW]);
 
   const nav=useCallback(dir=>{
     const m=new Date(monRef);m.setDate(m.getDate()+dir*7);setMonRef(m);loadW(getWD(m));
@@ -227,21 +245,20 @@ function App(){
   const total=useMemo(()=>results.reduce((s,r)=>s+r.credited,0),[results]);
   const pct=total/2400,done=total>=2400,remain=Math.max(0,2400-total),rH=Math.floor(remain/60),rM=remain%60;
 
+  if(restoring)return React.createElement("div",{style:{background:T.bg,minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center"}},React.createElement("span",{style:{color:T.sub,fontSize:14}},"로딩 중..."));
   if(!auth)return React.createElement(AuthScreen,{onLogin:handleLogin});
 
   const navBtnS={background:T.card,border:"1px solid "+T.border,borderRadius:8,width:32,height:32,cursor:"pointer",color:T.sub,fontSize:16,display:"flex",alignItems:"center",justifyContent:"center",boxShadow:T.shadow};
 
   return React.createElement("div",{style:{background:T.bg,minHeight:"100vh",padding:"20px 16px",color:T.text,maxWidth:440,margin:"0 auto"}},
-    // header
     React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}},
       React.createElement("div",{style:{display:"flex",alignItems:"center",gap:8}},
         React.createElement("span",{style:{fontSize:12,color:T.sub}},auth.username),
         syncing&&React.createElement("span",{style:{fontSize:10,color:T.accent}},"저장 중..."),
         !syncing&&lastSaved&&React.createElement("span",{style:{fontSize:10,color:T.ok}},"✓ 저장됨")
       ),
-      React.createElement("button",{onClick:()=>setAuth(null),style:{background:"none",border:"1px solid "+T.border,borderRadius:8,padding:"4px 10px",fontSize:11,color:T.sub,cursor:"pointer"}},"로그아웃")
+      React.createElement("button",{onClick:()=>{clearSession();setAuth(null);},style:{background:"none",border:"1px solid "+T.border,borderRadius:8,padding:"4px 10px",fontSize:11,color:T.sub,cursor:"pointer"}},"로그아웃")
     ),
-    // hero card
     React.createElement("div",{style:{background:T.card,borderRadius:20,padding:"20px 18px",boxShadow:T.shadow,marginBottom:12}},
       React.createElement("div",{style:{display:"flex",alignItems:"center",gap:16}},
         React.createElement(Ring,{pct,size:96,stroke:8,color:done?T.ok:pct>0.75?T.accent:T.warn},
@@ -276,7 +293,6 @@ function App(){
           )
         )
       ),
-      // mini bars
       React.createElement("div",{style:{display:"flex",gap:4,marginTop:14}},
         results.map((r,i)=>{
           const p=Math.min(1,r.credited/480);
@@ -290,7 +306,6 @@ function App(){
         })
       )
     ),
-    // week nav
     React.createElement("div",{style:{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"4px 4px",marginBottom:8}},
       React.createElement("button",{onClick:()=>nav(-1),style:navBtnS},"‹"),
       React.createElement("button",{onClick:goToday,style:{background:"none",border:"none",cursor:"pointer",padding:0}},
@@ -298,11 +313,9 @@ function App(){
       ),
       React.createElement("button",{onClick:()=>nav(1),style:navBtnS},"›")
     ),
-    // day cards
     React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:8}},
       weekDays.map((date,i)=>React.createElement(DayRow,{key:dk(date),date,data:week[i],result:results[i],isToday:same(date,today),onChange:(f,v)=>onChange(i,f,v),onInit:()=>initDay(i)}))
     ),
-    // footer
     React.createElement("div",{style:{marginTop:12,padding:"10px 14px",background:T.card,borderRadius:10,border:"1px solid "+T.border}},
       React.createElement("div",{style:{display:"flex",flexWrap:"wrap",gap:"2px 16px",justifyContent:"center"}},
         ["점심 1h 자동 제외","반차 +4h","반반차 +2h","연차 = 8h"].map((t,i)=>React.createElement("span",{key:i,style:{fontSize:10,color:T.sub}},t))
