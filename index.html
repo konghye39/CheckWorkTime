@@ -86,7 +86,7 @@ function Ring({pct,size,stroke,color,children}){
 }
 
 // ── DayRow ──
-function DayRow({date,data,result,isToday,onChange}){
+function DayRow({date,data,result,isToday,onChange,onInit}){
   const lv=LV[data.leaveType],isFull=data.leaveType==="full",filled=result.credited>=480;
   const cardBg=isToday?T.accentL:T.card,inputBg=isToday?"rgba(255,255,255,0.7)":T.bg;
   const timeStyle={width:"100%",background:inputBg,color:T.text,border:"1px solid "+T.border,borderRadius:8,padding:"7px 6px 5px",fontSize:14,fontFamily:"'SF Mono',monospace",textAlign:"center",outline:"none",boxSizing:"border-box"};
@@ -96,7 +96,7 @@ function DayRow({date,data,result,isToday,onChange}){
     // top row
     React.createElement("div",{style:{display:"flex",alignItems:"center",gap:8}},
       // day badge
-      React.createElement("div",{style:{width:36,height:36,borderRadius:10,background:isToday?T.accent:T.bg,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",flexShrink:0}},
+      React.createElement("div",{onClick:onInit,style:{width:36,height:36,borderRadius:10,background:isToday?T.accent:T.bg,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",flexShrink:0,cursor:"pointer"}},
         React.createElement("span",{style:{fontSize:13,fontWeight:700,color:isToday?"#fff":T.text,lineHeight:1}},DK[date.getDay()]),
         React.createElement("span",{style:{fontSize:8,color:isToday?"rgba(255,255,255,0.7)":T.sub,lineHeight:1,marginTop:1}},fmtMD(date))
       ),
@@ -197,7 +197,7 @@ function App(){
 
   const saveD=useCallback(async(date,data)=>{
     if(!auth)return;setSyncing(true);
-    try{await sbFetch("/rest/v1/work_hours",{method:"POST",token:auth.token,body:{user_id:auth.userId,date:dk(date),clock_in:data.clockIn||null,clock_out:data.clockOut||null,leave_type:data.leaveType}});setLastSaved(new Date());}
+    try{await sbFetch("/rest/v1/work_hours?on_conflict=user_id,date",{method:"POST",token:auth.token,body:{user_id:auth.userId,date:dk(date),clock_in:data.clockIn||null,clock_out:data.clockOut||null,leave_type:data.leaveType}});setLastSaved(new Date());}
     catch(e){console.error("Save:",e);}finally{setSyncing(false);}
   },[auth]);
 
@@ -214,13 +214,15 @@ function App(){
       const next=[...prev];const u={...next[idx],[field]:val};
       if(field==="leaveType"&&val==="full"){u.clockIn="";u.clockOut="";}
       if(field==="leaveType"&&val==="none"&&!u.clockIn){u.clockIn="09:00";u.clockOut="18:00";}
-      next[idx]=u;clearTimeout(timer.current);timer.current=setTimeout(()=>saveD(weekDays[idx],u),600);return next;
+      next[idx]=u;clearTimeout(timer.current);timer.current=setTimeout(()=>saveD(weekDays[idx],u),300);return next;
     });
   },[weekDays,saveD]);
 
   const todayIdx=useMemo(()=>weekDays.findIndex(d=>same(d,today)),[weekDays,today]);
   const isThisW=todayIdx>=0;
   const clockNow=useCallback(f=>{if(todayIdx<0)return;onChange(todayIdx,f,nowT());},[todayIdx,onChange]);
+  const initDay=useCallback(idx=>{setWeek(prev=>{const next=[...prev];if(next[idx].clockIn||next[idx].clockOut||next[idx].leaveType!=="none")return prev;const u={...next[idx],clockIn:"09:00",clockOut:"18:00"};next[idx]=u;clearTimeout(timer.current);timer.current=setTimeout(()=>saveD(weekDays[idx],u),300);return next;});},[weekDays,saveD]);
+  const targetLeave=useMemo(()=>{if(todayIdx<0)return null;const d=week[todayIdx];if(!d?.clockIn||d.leaveType==="full")return null;const need=540-LV[d.leaveType].credit*60;const m=toM(d.clockIn)+need;if(m>=1440||m<=0)return null;const h=Math.floor(m/60),mn=m%60;return String(h).padStart(2,"0")+":"+String(mn).padStart(2,"0");},[todayIdx,week]);
   const results=useMemo(()=>week.map(d=>calcD(d.clockIn,d.clockOut,d.leaveType)),[week]);
   const total=useMemo(()=>results.reduce((s,r)=>s+r.credited,0),[results]);
   const pct=total/2400,done=total>=2400,remain=Math.max(0,2400-total),rH=Math.floor(remain/60),rM=remain%60;
@@ -254,7 +256,8 @@ function App(){
         React.createElement("div",{style:{flex:1,display:"flex",flexDirection:"column",gap:8}},
           React.createElement("div",null,
             React.createElement("span",{style:{fontSize:11,color:T.sub}},"이번 주 근무시간"),
-            !done&&React.createElement("div",{style:{fontSize:13,fontWeight:600,color:T.accent,marginTop:2}},(rH>0?rH+"시간":"")+(rM>0?" "+rM+"분":"")+" 남음")
+            !done&&React.createElement("div",{style:{fontSize:13,fontWeight:600,color:T.accent,marginTop:2}},(rH>0?rH+"시간":"")+(rM>0?" "+rM+"분":"")+" 남음"),
+            targetLeave&&React.createElement("div",{style:{fontSize:12,fontWeight:600,color:T.ok,marginTop:2}},"오늘 "+targetLeave+" 퇴근 목표")
           ),
           isThisW&&React.createElement("div",{style:{display:"flex",gap:6}},
             React.createElement("button",{onClick:()=>clockNow("clockIn"),style:{flex:1,display:"flex",alignItems:"center",justifyContent:"center",gap:4,background:T.accentL,border:"none",borderRadius:10,padding:"9px 0",cursor:"pointer"}},
@@ -297,7 +300,7 @@ function App(){
     ),
     // day cards
     React.createElement("div",{style:{display:"flex",flexDirection:"column",gap:8}},
-      weekDays.map((date,i)=>React.createElement(DayRow,{key:dk(date),date,data:week[i],result:results[i],isToday:same(date,today),onChange:(f,v)=>onChange(i,f,v)}))
+      weekDays.map((date,i)=>React.createElement(DayRow,{key:dk(date),date,data:week[i],result:results[i],isToday:same(date,today),onChange:(f,v)=>onChange(i,f,v),onInit:()=>initDay(i)}))
     ),
     // footer
     React.createElement("div",{style:{marginTop:12,padding:"10px 14px",background:T.card,borderRadius:10,border:"1px solid "+T.border}},
