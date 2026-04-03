@@ -320,10 +320,11 @@ function App(){
         React.createElement(Ring,{pct,size:96,stroke:8,color:done?T.ok:pct>0.75?T.accent:T.warn},
           done?React.createElement(React.Fragment,null,
             React.createElement("span",{style:{fontSize:11,fontWeight:800,color:T.ok,letterSpacing:1}},"CLEAR"),
-            total>2400&&React.createElement("span",{style:{fontSize:9,color:T.sub}},"+"+dec(total-2400)+"h")
+            React.createElement("span",{style:{fontSize:9,color:T.sub,marginTop:1}},total>2400?"+"+(total-2400)+"분 초과":"딱 40h")
           ):React.createElement(React.Fragment,null,
             React.createElement("span",{style:{fontSize:20,fontWeight:800,color:T.text,fontFamily:"'SF Mono',monospace"}},dec(total)),
-            React.createElement("span",{style:{fontSize:9,color:T.sub}},"/ 40h")
+            React.createElement("span",{style:{fontSize:9,color:T.sub}},"/ 40h"),
+            React.createElement("span",{style:{fontSize:9,color:T.accent,fontWeight:600,marginTop:1}},remain+"분 부족")
           )
         ),
         React.createElement("div",{style:{flex:1,display:"flex",flexDirection:"column",gap:8}},
