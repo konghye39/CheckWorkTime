@@ -28,12 +28,12 @@ const { useState, useMemo, useCallback, useEffect, useRef } = React;
 const SB_URL = "https://xhjwurumbxcqiqpwtpvr.supabase.co";
 const SB_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inhoand1cnVtYnhjcWlxcHd0cHZyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUwNzkyMTAsImV4cCI6MjA5MDY1NTIxMH0.8c_K54Kz4XuIzmvA-kvjSFm76xVG8QP04GZPYz-jXEc";
 
-function sbFetch(path, { method = "GET", body, token } = {}) {
+function sbFetch(path, { method = "GET", body, token, keepalive } = {}) {
   const h = { apikey: SB_KEY, "Content-Type": "application/json",
     Prefer: method === "POST" ? "resolution=merge-duplicates,return=representation" : "return=representation" };
   if (token) h.Authorization = "Bearer " + token;
-  return fetch(SB_URL + path, { method, headers: h, body: body ? JSON.stringify(body) : undefined })
-    .then(async r => { const d = await r.json().catch(() => null); if (!r.ok) throw new Error(d?.msg || d?.message || r.statusText); return d; });
+  return fetch(SB_URL + path, { method, headers: h, body: body ? JSON.stringify(body) : undefined, keepalive })
+    .then(async r => { const d = await r.json().catch(() => null); if (!r.ok) { const err = new Error(d?.msg || d?.message || r.statusText); err.status = r.status; throw err; } return d; });
 }
 
 // ── Tokens ──
@@ -189,14 +189,56 @@ function App(){
   const[auth,setAuth]=useState(null);
   const[syncing,setSyncing]=useState(false);
   const[lastSaved,setLastSaved]=useState(null);
+  const[saveError,setSaveError]=useState(null);
+  const[pendingCount,setPendingCount]=useState(0);
   const[restoring,setRestoring]=useState(true);
   const today=useMemo(()=>new Date(),[]);
   const[monRef,setMonRef]=useState(()=>getMon(today));
   const weekDays=useMemo(()=>getWD(monRef),[monRef]);
   const[week,setWeek]=useState(()=>weekDays.map(()=>emptyD()));
-  const timer=useRef(null);
+  const authRef=useRef(null);
+  const timersRef=useRef({});       // { dateKey: timeoutId }
+  const pendingRef=useRef({});      // { dateKey: {date, data} }
+  const loadIdRef=useRef(0);
+  const refreshTimerRef=useRef(null);
+  const doRefreshRef=useRef(null);
+  const scheduleRefreshRef=useRef(null);
   const[todayClock,setTodayClock]=useState({clockIn:"",clockOut:"",leaveType:"none"});
   const[now,setNow]=useState(()=>new Date());
+  useEffect(()=>{authRef.current=auth;},[auth]);
+  const bumpPending=useCallback(()=>{setPendingCount(Object.keys(pendingRef.current).length);},[]);
+
+  doRefreshRef.current=async()=>{
+    const cur=authRef.current;if(!cur?.refreshToken)return null;
+    const s=await refreshToken(cur.refreshToken);
+    if(s){saveSession(s);setAuth(s);scheduleRefreshRef.current?.(s.token);return s;}
+    clearSession();setAuth(null);return null;
+  };
+  scheduleRefreshRef.current=(token)=>{
+    clearTimeout(refreshTimerRef.current);
+    try{
+      const payload=JSON.parse(atob(token.split(".")[1]));
+      const expMs=(payload.exp||0)*1000;
+      const delay=Math.max(60000,expMs-Date.now()-5*60000);
+      refreshTimerRef.current=setTimeout(()=>{doRefreshRef.current?.();},delay);
+    }catch(e){}
+  };
+  useEffect(()=>{
+    if(auth?.token)scheduleRefreshRef.current?.(auth.token);
+    return()=>clearTimeout(refreshTimerRef.current);
+  },[auth?.token]);
+
+  const authedFetch=useCallback(async(path,opts={})=>{
+    const cur=authRef.current;if(!cur)throw new Error("로그인이 필요합니다");
+    try{return await sbFetch(path,{...opts,token:cur.token});}
+    catch(e){
+      const looksAuth=e.status===401||/jwt|expired|invalid token|not authenticated/i.test(e.message||"");
+      if(!looksAuth)throw e;
+      const refreshed=await doRefreshRef.current?.();
+      if(!refreshed)throw e;
+      return await sbFetch(path,{...opts,token:refreshed.token});
+    }
+  },[]);
 
   // tick every 30s for countdown
   useEffect(()=>{const id=setInterval(()=>setNow(new Date()),30000);return()=>clearInterval(id);},[]);
@@ -213,50 +255,101 @@ function App(){
   },[]);
 
   const loadW=useCallback(async(days,s)=>{
-    const ss=s||auth;if(!ss)return;
+    const ss=s||authRef.current;if(!ss)return;
+    const myId=++loadIdRef.current;
     try{
       const f=dk(days[0]),t=dk(days[4]);
-      const rows=await sbFetch("/rest/v1/work_hours?user_id=eq."+ss.userId+"&date=gte."+f+"&date=lte."+t+"&order=date",{token:ss.token});
+      const path="/rest/v1/work_hours?user_id=eq."+ss.userId+"&date=gte."+f+"&date=lte."+t+"&order=date";
+      const rows=s?await sbFetch(path,{token:ss.token}):await authedFetch(path);
+      if(myId!==loadIdRef.current)return;
       const map={};(rows||[]).forEach(r=>{map[r.date]=r;});
       const mapped=days.map(d=>{const r=map[dk(d)];if(!r)return emptyD();return{clockIn:r.clock_in?r.clock_in.slice(0,5):"",clockOut:r.clock_out?r.clock_out.slice(0,5):"",leaveType:r.leave_type||"none"};});
-      setWeek(mapped);
-      // sync todayClock if this week contains today
+      // skip days with unsaved local edits to avoid stomping them
+      const dayKeysWithPending=pendingRef.current;
+      setWeek(prev=>mapped.map((m,i)=>dayKeysWithPending[dk(days[i])]?(prev[i]||m):m));
       const ti=days.findIndex(d=>same(d,today));
-      if(ti>=0)setTodayClock(mapped[ti]);
+      if(ti>=0&&!dayKeysWithPending[dk(days[ti])])setTodayClock(mapped[ti]);
     }catch(e){console.error("Load:",e);}
-  },[auth]);
+  },[authedFetch,today]);
 
   // load today separately when viewing other weeks (on mount)
   const loadToday=useCallback(async(s)=>{
-    const ss=s||auth;if(!ss)return;
+    const ss=s||authRef.current;if(!ss)return;
     try{
-      const rows=await sbFetch("/rest/v1/work_hours?user_id=eq."+ss.userId+"&date=eq."+dk(today),{token:ss.token});
+      const path="/rest/v1/work_hours?user_id=eq."+ss.userId+"&date=eq."+dk(today);
+      const rows=s?await sbFetch(path,{token:ss.token}):await authedFetch(path);
       if(rows&&rows[0]){const r=rows[0];setTodayClock({clockIn:r.clock_in?r.clock_in.slice(0,5):"",clockOut:r.clock_out?r.clock_out.slice(0,5):"",leaveType:r.leave_type||"none"});}
     }catch(e){}
-  },[auth,today]);
+  },[authedFetch,today]);
 
-  const saveD=useCallback(async(date,data)=>{
-    if(!auth)return;setSyncing(true);
-    try{await sbFetch("/rest/v1/work_hours?on_conflict=user_id,date",{method:"POST",token:auth.token,body:{user_id:auth.userId,date:dk(date),clock_in:data.clockIn||null,clock_out:data.clockOut||null,leave_type:data.leaveType}});setLastSaved(new Date());}
-    catch(e){console.error("Save:",e);}finally{setSyncing(false);}
-  },[auth]);
+  const saveD=useCallback(async(date,data,opts={})=>{
+    const cur=authRef.current;if(!cur)return;
+    const key=dk(date);
+    setSyncing(true);
+    try{
+      await authedFetch("/rest/v1/work_hours?on_conflict=user_id,date",{
+        method:"POST",
+        body:{user_id:cur.userId,date:key,clock_in:data.clockIn||null,clock_out:data.clockOut||null,leave_type:data.leaveType},
+        keepalive:opts.keepalive,
+      });
+      if(pendingRef.current[key]&&pendingRef.current[key].data===data){
+        delete pendingRef.current[key];bumpPending();
+      }
+      setSaveError(null);setLastSaved(new Date());
+    }catch(e){console.error("Save:",e);setSaveError(e.message||"저장 실패");}
+    finally{setSyncing(false);}
+  },[authedFetch,bumpPending]);
+
+  const scheduleSave=useCallback((date,data)=>{
+    const key=dk(date);
+    pendingRef.current[key]={date,data};
+    bumpPending();
+    clearTimeout(timersRef.current[key]);
+    timersRef.current[key]=setTimeout(()=>{
+      delete timersRef.current[key];
+      const p=pendingRef.current[key];
+      if(p)saveD(p.date,p.data);
+    },300);
+  },[saveD,bumpPending]);
+
+  const flush=useCallback(()=>{
+    Object.keys(timersRef.current).forEach(key=>{
+      clearTimeout(timersRef.current[key]);delete timersRef.current[key];
+      const p=pendingRef.current[key];
+      if(p)saveD(p.date,p.data,{keepalive:true});
+    });
+  },[saveD]);
+
+  useEffect(()=>{
+    const onVis=()=>{if(document.visibilityState==="hidden")flush();};
+    const onUnload=()=>{flush();};
+    document.addEventListener("visibilitychange",onVis);
+    window.addEventListener("beforeunload",onUnload);
+    window.addEventListener("pagehide",onUnload);
+    return()=>{
+      document.removeEventListener("visibilitychange",onVis);
+      window.removeEventListener("beforeunload",onUnload);
+      window.removeEventListener("pagehide",onUnload);
+    };
+  },[flush]);
 
   const handleLogin=useCallback(s=>{saveSession(s);setAuth(s);loadW(getWD(getMon(today)),s);loadToday(s);},[today,loadW,loadToday]);
 
   const nav=useCallback(dir=>{
+    flush();
     const m=new Date(monRef);m.setDate(m.getDate()+dir*7);setMonRef(m);loadW(getWD(m));
-  },[monRef,loadW]);
+  },[monRef,loadW,flush]);
 
-  const goToday=useCallback(()=>{const m=getMon(today);setMonRef(m);loadW(getWD(m));},[today,loadW]);
+  const goToday=useCallback(()=>{flush();const m=getMon(today);setMonRef(m);loadW(getWD(m));},[today,loadW,flush]);
 
   const onChange=useCallback((idx,field,val)=>{
     setWeek(prev=>{
       const next=[...prev];const u={...next[idx],[field]:val};
       if(field==="leaveType"&&val==="full"){u.clockIn="";u.clockOut="";}
       if(field==="leaveType"&&val==="none"&&!u.clockIn){u.clockIn="09:00";u.clockOut="18:00";}
-      next[idx]=u;clearTimeout(timer.current);timer.current=setTimeout(()=>saveD(weekDays[idx],u),300);return next;
+      next[idx]=u;scheduleSave(weekDays[idx],u);return next;
     });
-  },[weekDays,saveD]);
+  },[weekDays,scheduleSave]);
 
   const todayIdx=useMemo(()=>weekDays.findIndex(d=>same(d,today)),[weekDays,today]);
   const isThisW=todayIdx>=0;
@@ -268,9 +361,9 @@ function App(){
     else{
       const updated={...todayClock,[f]:t};
       setTodayClock(updated);
-      saveD(today,updated);
+      scheduleSave(today,updated);
     }
-  },[todayIdx,onChange,todayClock,today,saveD]);
+  },[todayIdx,onChange,todayClock,today,scheduleSave]);
 
   // sync todayClock when editing today in current week view
   const origOnChange=onChange;
@@ -279,7 +372,7 @@ function App(){
     if(isThisW&&idx===todayIdx){setTodayClock(prev=>({...prev,[field]:val}));}
   },[origOnChange,isThisW,todayIdx]);
 
-  const initDay=useCallback(idx=>{setWeek(prev=>{const next=[...prev];if(next[idx].clockIn||next[idx].clockOut||next[idx].leaveType!=="none")return prev;const u={...next[idx],clockIn:"09:00",clockOut:"18:00"};next[idx]=u;clearTimeout(timer.current);timer.current=setTimeout(()=>saveD(weekDays[idx],u),300);return next;});},[weekDays,saveD]);
+  const initDay=useCallback(idx=>{setWeek(prev=>{const next=[...prev];if(next[idx].clockIn||next[idx].clockOut||next[idx].leaveType!=="none")return prev;const u={...next[idx],clockIn:"09:00",clockOut:"18:00"};next[idx]=u;scheduleSave(weekDays[idx],u);return next;});},[weekDays,scheduleSave]);
 
   // get today's data regardless of which week is displayed
   const todayData=isThisW?week[todayIdx]:todayClock;
@@ -310,7 +403,9 @@ function App(){
       React.createElement("div",{style:{display:"flex",alignItems:"center",gap:8}},
         React.createElement("span",{style:{fontSize:12,color:T.sub}},auth.username),
         syncing&&React.createElement("span",{style:{fontSize:10,color:T.accent}},"저장 중..."),
-        !syncing&&lastSaved&&React.createElement("span",{style:{fontSize:10,color:T.ok}},"✓ 저장됨")
+        !syncing&&saveError&&React.createElement("span",{title:saveError,style:{fontSize:10,color:T.danger,cursor:"help"}},"⚠ 저장 실패 (재시도 중)"),
+        !syncing&&!saveError&&pendingCount>0&&React.createElement("span",{style:{fontSize:10,color:T.warn}},"● 저장 대기 "+pendingCount),
+        !syncing&&!saveError&&pendingCount===0&&lastSaved&&React.createElement("span",{style:{fontSize:10,color:T.ok}},"✓ 저장됨")
       ),
       React.createElement("button",{onClick:()=>{clearSession();setAuth(null);},style:{background:"none",border:"1px solid "+T.border,borderRadius:8,padding:"4px 10px",fontSize:11,color:T.sub,cursor:"pointer"}},"로그아웃")
     ),
